@@ -6,7 +6,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-xxhash-rust = { version = "*", features = ["xxh3", "xxh64", "xxh32"] }
-hex = "*"
+xxhash-rust = { version = "*", features = ["xxh3"] }
 blake3 = "*"
 
