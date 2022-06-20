@@ -89,26 +89,15 @@ impl<const M: usize, const K: usize> Bloom<M, K> {
             .update(&self.bytes)
             .finalize_xof();
         let mut buffer = [0u8; 32];
-        let mut popcount = self.count_ones();
-
-        if popcount > 1019 {
-            return;
-        }
 
         loop {
             xof.fill(&mut buffer);
             let mut cloned = self.clone();
             cloned.add(&buffer);
-            let cloned_popcount = cloned.count_ones();
-            if cloned_popcount > 1019 {
-                // take the thing closer to 1019 bits set
-                if cloned_popcount - 1019 < 1019 - popcount {
-                    self.bytes = cloned.bytes;
-                }
+            if cloned.count_ones() > 1019 {
                 return;
             } else {
                 self.bytes = cloned.bytes;
-                popcount = cloned_popcount;
             }
         }
     }
