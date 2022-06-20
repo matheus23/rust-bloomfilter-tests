@@ -9,3 +9,6 @@ edition = "2021"
 xxhash-rust = { version = "*", features = ["xxh3"] }
 blake3 = "*"
 rand = "*"
+sha3 = "*"
+hex = "*"
+
