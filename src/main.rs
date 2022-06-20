@@ -1,49 +1,73 @@
-use std::time::Instant;
+use std::{io::Write, time::Instant};
 
 use blake3;
+use rand::RngCore;
 use xxhash_rust::xxh3;
 
-struct Bloom<const N: usize> {
-    bytes: [u8; N],
-    k_hashes: u64,
+// M bytes (m = M * 8) and K hash functions
+struct Bloom<const M: usize, const K: usize> {
+    bytes: [u8; M],
 }
 
-const LUT: [u8; 8] = [
-    0b0000_0001,
-    0b0000_0010,
-    0b0000_0100,
-    0b0000_1000,
-    0b0001_0000,
-    0b0010_0000,
-    0b0100_0000,
-    0b1000_0000,
-];
+// Indices in a bloom filter based on XXH3
 
-impl<const N: usize> Bloom<N> {
-    pub fn new(k_hashes: u64) -> Self {
+struct BloomIndicesXXH3<'a, const M: usize> {
+    element: &'a [u8],
+    seed: u64,
+}
+
+impl<'a, const M: usize> From<&'a [u8]> for BloomIndicesXXH3<'a, M> {
+    fn from(element: &'a [u8]) -> Self {
+        Self { element, seed: 0 }
+    }
+}
+
+impl<'a, const M: usize> Iterator for BloomIndicesXXH3<'a, M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let hash = xxh3::xxh3_64_with_seed(self.element, self.seed) as usize;
+        self.seed += 1;
+        Some(hash % (M * 8))
+    }
+}
+
+struct BloomIndicesBlake3<const M: usize> {
+    output_reader: blake3::OutputReader,
+}
+
+impl<const M: usize> From<&[u8]> for BloomIndicesBlake3<M> {
+    fn from(element: &[u8]) -> Self {
         Self {
-            bytes: [0; N],
-            k_hashes,
+            output_reader: blake3::Hasher::new().update(element).finalize_xof(),
         }
     }
+}
 
-    pub fn indices<'a>(&self, element: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
-        (0..self.k_hashes).map(|seed| {
-            let hash = xxh3::xxh3_64_with_seed(element, seed) as usize;
-            // let hash = xxh64::xxh64(element, seed) as usize;
-            // let hash = xxh32::xxh32(element, seed as u32) as usize;
-            hash % (N * 8)
-        })
+impl<const M: usize> Iterator for BloomIndicesBlake3<M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [0u8; 8];
+        self.output_reader.fill(&mut buf);
+        let yld = usize::from_le_bytes(buf);
+        Some(yld % (M * 8))
+    }
+}
+
+impl<const M: usize, const K: usize> Bloom<M, K> {
+    pub fn new() -> Self {
+        Self { bytes: [0; M] }
     }
 
     pub fn add(&mut self, element: &[u8]) {
-        for index in self.indices(element) {
+        for index in BloomIndicesXXH3::<M>::from(element).take(K) {
             self.set_bit(index);
         }
     }
 
     pub fn has(&self, element: &[u8]) -> bool {
-        for index in self.indices(element) {
+        for index in BloomIndicesXXH3::<M>::from(element).take(K) {
             if !self.test_bit(index) {
                 return false;
             }
@@ -62,47 +86,89 @@ impl<const N: usize> Bloom<N> {
     fn set_bit(&mut self, index: usize) {
         let byte_index = index / 8;
         let bit_index = index % 8;
-        self.bytes[byte_index] |= LUT[bit_index];
+        self.bytes[byte_index] |= 1u8 << bit_index;
     }
 
     fn test_bit(&self, index: usize) -> bool {
         let byte_index = index / 8;
         let bit_index = index % 8;
-        (self.bytes[byte_index] & LUT[bit_index]) != 0
+        (self.bytes[byte_index] & (1u8 << bit_index)) != 0
     }
 }
 
-const PREFILL: u32 = 47;
-const TESTS: u64 = 10_000_000_000;
+fn fill_deterministic<const M: usize, const K: usize>(
+    seed: &str,
+    elements: u32,
+    bloom: &mut Bloom<M, K>,
+) {
+    let mut output_reader = blake3::Hasher::new_derive_key(seed)
+        .update(b"Hello, world!")
+        .finalize_xof();
 
-fn main() {
-    let mut bloom: Bloom<256> = Bloom::new(30);
+    let mut buffer = [0u8; 32];
 
-    let mut hash = blake3::hash(b"Seed?");
-    let mut hash_bytes: &[u8; 32] = hash.as_bytes();
+    for _ in 0..elements {
+        output_reader.fill(&mut buffer);
+        bloom.add(&buffer);
+    }
+}
 
-    for _ in 0..PREFILL {
-        bloom.add(hash_bytes);
+fn fill_random<const M: usize, const K: usize>(elements: u32, bloom: &mut Bloom<M, K>) {
+    for _ in 0..elements {
+        let mut randoms = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut randoms);
+        bloom.add(&randoms);
+    }
+}
 
-        hash = blake3::hash(hash_bytes);
-        hash_bytes = hash.as_bytes();
+fn print_test_progress(i: u64, tests: u64) {
+    print!("\r{:>5}/{tests}            ", i);
+    std::io::stdout().flush().unwrap();
+}
+
+fn test_avg_bits(prefill: u32, tests: u64) {
+    let mut sum = 0;
+    for i in 0..tests {
+        let mut bloom: Bloom<256, 30> = Bloom::new();
+        fill_random(prefill, &mut bloom);
+
+        sum += bloom.count_ones();
+        print_test_progress(i, tests);
     }
 
-    // now the bloom filter is filled with 47 PRNG items
+    println!("\n{}", (sum as f64) / (tests as f64));
+}
+
+fn test_false_positive_rate(prefill: u32, tests: u64) {
+    let mut bloom: Bloom<256, 30> = Bloom::new();
+
+    fill_deterministic("Bloom filter prefill", prefill, &mut bloom);
 
     println!("{}", bloom.count_ones());
     let before = Instant::now();
 
     let mut false_positive_count = 0;
-    for i in 0..TESTS {
+    for i in 0..tests {
         if bloom.has(&i.to_le_bytes()) {
             false_positive_count += 1;
+        }
+        if i % 100_000 == 0 {
+            print_test_progress(i, tests);
         }
     }
 
     let after = Instant::now();
     println!(
-        "{false_positive_count}/{TESTS} {}ms",
+        "{false_positive_count}/{tests} {}ms",
         after.duration_since(before).as_millis()
     );
+}
+
+#[test]
+fn test_bitavg() {
+    test_avg_bits(47, 10_000);
+}
+
+fn main() {
+    test_false_positive_rate(47, 1_000_000_000);
 }
