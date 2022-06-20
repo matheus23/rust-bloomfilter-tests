@@ -2,9 +2,10 @@ use std::{io::Write, time::Instant};
 
 use blake3;
 use rand::RngCore;
-use xxhash_rust::xxh3;
+use xxhash_rust::xxh3::{self, xxh3_64};
 
 // M bytes (m = M * 8) and K hash functions
+#[derive(Clone)]
 struct Bloom<const M: usize, const K: usize> {
     bytes: [u8; M],
 }
@@ -83,6 +84,24 @@ impl<const M: usize, const K: usize> Bloom<M, K> {
         ones
     }
 
+    pub fn saturate(&mut self) {
+        let mut xof = blake3::Hasher::new_derive_key("nyberg accumulator saturation")
+            .update(&self.bytes)
+            .finalize_xof();
+        let mut buffer = [0u8; 32];
+
+        loop {
+            xof.fill(&mut buffer);
+            let mut cloned = self.clone();
+            cloned.add(&buffer);
+            if cloned.count_ones() > 1019 {
+                return;
+            } else {
+                self.bytes = cloned.bytes;
+            }
+        }
+    }
+
     fn set_bit(&mut self, index: usize) {
         let byte_index = index / 8;
         let bit_index = index % 8;
@@ -122,8 +141,10 @@ fn fill_random<const M: usize, const K: usize>(elements: u32, bloom: &mut Bloom<
 }
 
 fn print_test_progress(i: u64, tests: u64) {
-    print!("\r{:>5}/{tests}            ", i);
-    std::io::stdout().flush().unwrap();
+    if (i % 1000 == 0) {
+        print!("\r{:>5}/{tests}            ", i);
+        std::io::stdout().flush().unwrap();
+    }
 }
 
 fn test_avg_bits(prefill: u32, tests: u64) {
@@ -137,6 +158,34 @@ fn test_avg_bits(prefill: u32, tests: u64) {
     }
 
     println!("\n{}", (sum as f64) / (tests as f64));
+}
+
+const TESTS: usize = 100_000;
+fn test_avg_saturation_bits() {
+    let mut histo = [0u64; 256];
+
+    const BYTES: usize = 32 * TESTS;
+
+    let mut rando = [0u8; BYTES];
+    rand::thread_rng().fill_bytes(&mut rando);
+
+    let before = Instant::now();
+    for i in 0..TESTS {
+        let mut bloom: Bloom<256, 30> = Bloom::new();
+
+        bloom.add(&rando[i * 32..(i + 1) * 32]);
+        bloom.saturate();
+
+        histo[bloom.count_ones() as usize - 896] += 1;
+        print_test_progress(i as u64, TESTS as u64);
+    }
+    let after = Instant::now();
+
+    println!("\nbits;amount");
+    for (i, v) in histo.iter().enumerate() {
+        println!("{};{v}", i + 896);
+    }
+    println!("{}", after.duration_since(before).as_millis());
 }
 
 fn test_false_positive_rate(prefill: u32, tests: u64) {
@@ -164,11 +213,48 @@ fn test_false_positive_rate(prefill: u32, tests: u64) {
     );
 }
 
-#[test]
-fn test_bitavg() {
-    test_avg_bits(47, 10_000);
+fn main() {
+    // test_false_positive_rate(47, 1_000_000_000);
+    test_avg_saturation_bits();
 }
 
-fn main() {
-    test_false_positive_rate(47, 1_000_000_000);
+#[test]
+fn test_bitavg() {
+    test_avg_bits(47, 100_000);
+}
+
+#[test]
+fn test_sha3_hashing_speed() {
+    let before = Instant::now();
+    use sha3::Digest;
+
+    let mut hasher = sha3::Sha3_256::default();
+    hasher.update(b"Hello, World!");
+    let mut hash: [u8; 32] = hasher.finalize_reset().into();
+
+    for _ in 0..100_000_000 {
+        hasher.update(hash);
+        hash = hasher.finalize_reset().into();
+    }
+
+    let after = Instant::now();
+    println!(
+        "{} {}",
+        after.duration_since(before).as_millis(),
+        hex::encode(hash)
+    );
+}
+
+#[test]
+fn test_xxh3_hashing_speed() {
+    let before = Instant::now();
+
+    let mut hash: u64 = 1000;
+
+    for _ in 0..100_000_000 {
+        hash = xxh3_64(&hash.to_le_bytes());
+    }
+
+    let after = Instant::now();
+    println!("{} {}", after.duration_since(before).as_millis(), hash);
 }
