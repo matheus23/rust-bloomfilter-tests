@@ -8,4 +8,4 @@ edition = "2021"
 [dependencies]
 xxhash-rust = { version = "*", features = ["xxh3"] }
 blake3 = "*"
-
+rand = "*"
