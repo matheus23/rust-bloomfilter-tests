@@ -2,7 +2,7 @@ use std::{io::Write, time::Instant};
 
 use blake3;
 use rand::RngCore;
-use xxhash_rust::xxh3::{self, xxh3_64};
+use xxhash_rust::xxh3::{self};
 
 // M bytes (m = M * 8) and K hash functions
 #[derive(Clone)]
@@ -224,26 +224,40 @@ fn test_bitavg() {
 }
 
 #[test]
-fn test_sha3_hashing_speed() {
-    let before = Instant::now();
-    use sha3::Digest;
+fn test_xof() {
+    use sha3;
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
 
-    let mut hasher = sha3::Sha3_256::default();
+    let mut hasher = sha3::Shake256::default();
     hasher.update(b"Hello, World!");
-    let mut hash: [u8; 32] = hasher.finalize_reset().into();
+    let mut xof = hasher.finalize_xof();
+    let buffer = &mut [0u8; 10];
+    xof.read(buffer);
 
-    for _ in 0..100_000_000 {
-        hasher.update(hash);
-        hash = hasher.finalize_reset().into();
-    }
-
-    let after = Instant::now();
-    println!(
-        "{} {}",
-        after.duration_since(before).as_millis(),
-        hex::encode(hash)
-    );
+    println!("{:02x?}", buffer);
 }
+
+// #[test]
+// fn test_sha3_hashing_speed() {
+//     let before = Instant::now();
+//     use sha3::Digest;
+
+//     let mut hasher = sha3::Sha3_256::default();
+//     hasher.update(b"Hello, World!");
+//     let mut hash: [u8; 32] = hasher.finalize_reset().into();
+
+//     for _ in 0..100_000_000 {
+//         hasher.update(hash);
+//         hash = hasher.finalize_reset().into();
+//     }
+
+//     let after = Instant::now();
+//     println!(
+//         "{} {}",
+//         after.duration_since(before).as_millis(),
+//         hex::encode(hash)
+//     );
+// }
 
 #[test]
 fn test_xxh3_hashing_speed() {
