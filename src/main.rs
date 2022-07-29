@@ -1,6 +1,9 @@
-use std::{io::Write, time::Instant};
+mod folded;
+
+use std::{io::Write, iter, time::Instant};
 
 use blake3;
+use folded::Folded;
 use rand::RngCore;
 use xxhash_rust::xxh3::{self};
 
@@ -33,6 +36,76 @@ impl<'a, const M: usize> Iterator for BloomIndicesXXH3<'a, M> {
     }
 }
 
+struct BloomIndicesXXH3RejectionSampling<'a, const M: usize> {
+    element: &'a [u8],
+    bitmask: usize,
+    seed: u64,
+}
+
+impl<'a, const M: usize> From<&'a [u8]> for BloomIndicesXXH3RejectionSampling<'a, M> {
+    fn from(element: &'a [u8]) -> Self {
+        let max = M * 8;
+        let bitmask = (if max.count_ones() == 1 {
+            max
+        } else {
+            max.next_power_of_two()
+        } - 1);
+        Self {
+            element,
+            bitmask,
+            seed: 0,
+        }
+    }
+}
+
+impl<'a, const M: usize> Iterator for BloomIndicesXXH3RejectionSampling<'a, M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut index = (xxh3::xxh3_64_with_seed(self.element, self.seed) as usize) & self.bitmask;
+
+        // Try to generate something within bounds
+        while index >= M * 8 {
+            self.seed += 1;
+            index = (xxh3::xxh3_64_with_seed(self.element, self.seed) as usize) & self.bitmask;
+        }
+
+        self.seed += 1;
+        Some(index)
+    }
+}
+
+struct BloomIndicesDistinctXXH3<'a, const M: usize> {
+    used_nums: [bool; M],
+    index_iterator: BloomIndicesXXH3<'a, M>,
+}
+
+impl<'a, const M: usize> Iterator for BloomIndicesDistinctXXH3<'a, M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        macro_rules! otry {
+            ($e:expr) => {
+                match $e {
+                    Some(e) => e,
+                    None => return None,
+                }
+            };
+        }
+        let mut index = otry!(self.index_iterator.next());
+        loop {
+            let was_used = self.used_nums[index];
+            self.used_nums[index] = true;
+
+            if !was_used {
+                return Some(index);
+            }
+
+            index = otry!(self.index_iterator.next());
+        }
+    }
+}
+
 struct BloomIndicesBlake3<const M: usize> {
     output_reader: blake3::OutputReader,
 }
@@ -62,13 +135,13 @@ impl<const M: usize, const K: usize> Bloom<M, K> {
     }
 
     pub fn add(&mut self, element: &[u8]) {
-        for index in BloomIndicesXXH3::<M>::from(element).take(K) {
+        for index in BloomIndicesXXH3RejectionSampling::<M>::from(element).take(K) {
             self.set_bit(index);
         }
     }
 
     pub fn has(&self, element: &[u8]) -> bool {
-        for index in BloomIndicesXXH3::<M>::from(element).take(K) {
+        for index in BloomIndicesXXH3RejectionSampling::<M>::from(element).take(K) {
             if !self.test_bit(index) {
                 return false;
             }
@@ -141,7 +214,7 @@ fn fill_random<const M: usize, const K: usize>(elements: u32, bloom: &mut Bloom<
 }
 
 fn print_test_progress(i: u64, tests: u64) {
-    if (i % 1000 == 0) {
+    if i % 1000 == 0 {
         print!("\r{:>5}/{tests}            ", i);
         std::io::stdout().flush().unwrap();
     }
@@ -215,7 +288,8 @@ fn test_false_positive_rate(prefill: u32, tests: u64) {
 
 fn main() {
     // test_false_positive_rate(47, 1_000_000_000);
-    test_avg_saturation_bits();
+    // test_avg_saturation_bits();
+    test_folded_rates();
 }
 
 #[test]
@@ -266,9 +340,103 @@ fn test_xxh3_hashing_speed() {
     let mut hash: u64 = 1000;
 
     for _ in 0..100_000_000 {
-        hash = xxh3_64(&hash.to_le_bytes());
+        hash = xxh3::xxh3_64(&hash.to_le_bytes());
     }
 
     let after = Instant::now();
     println!("{} {}", after.duration_since(before).as_millis(), hash);
+}
+
+struct Blake3XOF {
+    output_reader: blake3::OutputReader,
+}
+
+impl Blake3XOF {
+    fn new<D: AsRef<[u8]>>(data: &D) -> Self {
+        Self {
+            output_reader: blake3::Hasher::new().update(data.as_ref()).finalize_xof(),
+        }
+    }
+}
+
+impl Iterator for Blake3XOF {
+    type Item = [u8; 32];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut bytes = [0u8; 32];
+        self.output_reader.fill(&mut bytes);
+        Some(bytes)
+    }
+}
+
+const M: usize = 262_144; // original bloom filter bits
+const K: usize = 18; // num of hash functions
+const F: usize = 0; // num of folds
+const S: usize = (M / 8) >> F; // byte size of folded filter
+
+fn test_folded_rates() {
+    let min = 4000;
+    let max = 30000;
+    let step_size = 100;
+
+    for n_fac in (min / step_size)..(max / step_size + 1) {
+        let n = step_size * n_fac;
+
+        let mut filter: Folded<F, S, K> = Folded::new();
+        for item in Blake3XOF::new(b"In the filter").take(n) {
+            filter.insert(&item);
+        }
+
+        let mut false_negative_count = 0;
+        for item_in_filter in Blake3XOF::new(b"In the filter").take(n) {
+            if !filter.has(&item_in_filter) {
+                false_negative_count += 1;
+            }
+        }
+
+        let mut false_positive_count = 0;
+        for not_in_filter in Blake3XOF::new(b"Not in the filter").take(1_000_000) {
+            if filter.has(&not_in_filter) {
+                false_positive_count += 1;
+            }
+        }
+
+        println!("{n}, {false_negative_count}, {false_positive_count}")
+    }
+}
+
+#[test]
+fn test_vectors() {
+    let mut bloom: Bloom<125, 4> = Bloom::new();
+    bloom.add(b"one");
+    // bloom.add(b"two");
+    bloom.add(b"three");
+    assert_eq!(hex::encode(bloom.bytes), "0000000000000000000000000000000000000000000000000000000000000000000000000000100000000000004000000000000001000000000000000000000000000400004000000000000000800000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000400");
+}
+
+#[test]
+fn test_sth() {
+    // let decoded: Vec<u8> = hex::decode("0000000000000000000000000000000000000000000000000000000000000000000000000000100000000000004000000000000001000000000000000000000000000400004000000000000000800000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000400").unwrap();
+    let decoded: Vec<u8> = hex::decode("0000000000000000000000000000000000000000000400000000000000000000000000000000100000000000004000000008000001000000000000000000002000000400004000000000000000800000000000000000000000000000000000000000000000000000000000002000000020000000000000000000000400").unwrap();
+    let mut count = 0;
+    for u in decoded {
+        count += u.count_ones();
+    }
+    println!("{count}");
+}
+
+#[test]
+fn test_indices() {
+    println!("indices for 'one':");
+    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"one" as &[u8]).take(4) {
+        println!("{index}");
+    }
+    println!("indices for 'two':");
+    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"two" as &[u8]).take(4) {
+        println!("{index}");
+    }
+    println!("indices for 'three':");
+    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"three" as &[u8]).take(4) {
+        println!("{index}");
+    }
 }
