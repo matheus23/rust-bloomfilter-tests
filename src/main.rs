@@ -1,132 +1,17 @@
 mod folded;
-
-use std::{io::Write, iter, time::Instant};
+mod iterators;
 
 use blake3;
 use folded::Folded;
+use iterators::*;
 use rand::RngCore;
-use xxhash_rust::xxh3::{self};
+use std::{io::Write, time::Instant};
+use xxhash_rust::xxh3;
 
 // M bytes (m = M * 8) and K hash functions
 #[derive(Clone)]
 struct Bloom<const M: usize, const K: usize> {
     bytes: [u8; M],
-}
-
-// Indices in a bloom filter based on XXH3
-
-struct BloomIndicesXXH3<'a, const M: usize> {
-    element: &'a [u8],
-    seed: u64,
-}
-
-impl<'a, const M: usize> From<&'a [u8]> for BloomIndicesXXH3<'a, M> {
-    fn from(element: &'a [u8]) -> Self {
-        Self { element, seed: 0 }
-    }
-}
-
-impl<'a, const M: usize> Iterator for BloomIndicesXXH3<'a, M> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let hash = xxh3::xxh3_64_with_seed(self.element, self.seed) as usize;
-        self.seed += 1;
-        Some(hash % (M * 8))
-    }
-}
-
-struct BloomIndicesXXH3RejectionSampling<'a, const M: usize> {
-    element: &'a [u8],
-    bitmask: usize,
-    seed: u64,
-}
-
-impl<'a, const M: usize> From<&'a [u8]> for BloomIndicesXXH3RejectionSampling<'a, M> {
-    fn from(element: &'a [u8]) -> Self {
-        let max = M * 8;
-        let bitmask = (if max.count_ones() == 1 {
-            max
-        } else {
-            max.next_power_of_two()
-        } - 1);
-        Self {
-            element,
-            bitmask,
-            seed: 0,
-        }
-    }
-}
-
-impl<'a, const M: usize> Iterator for BloomIndicesXXH3RejectionSampling<'a, M> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut index = (xxh3::xxh3_64_with_seed(self.element, self.seed) as usize) & self.bitmask;
-
-        // Try to generate something within bounds
-        while index >= M * 8 {
-            self.seed += 1;
-            index = (xxh3::xxh3_64_with_seed(self.element, self.seed) as usize) & self.bitmask;
-        }
-
-        self.seed += 1;
-        Some(index)
-    }
-}
-
-struct BloomIndicesDistinctXXH3<'a, const M: usize> {
-    used_nums: [bool; M],
-    index_iterator: BloomIndicesXXH3<'a, M>,
-}
-
-impl<'a, const M: usize> Iterator for BloomIndicesDistinctXXH3<'a, M> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        macro_rules! otry {
-            ($e:expr) => {
-                match $e {
-                    Some(e) => e,
-                    None => return None,
-                }
-            };
-        }
-        let mut index = otry!(self.index_iterator.next());
-        loop {
-            let was_used = self.used_nums[index];
-            self.used_nums[index] = true;
-
-            if !was_used {
-                return Some(index);
-            }
-
-            index = otry!(self.index_iterator.next());
-        }
-    }
-}
-
-struct BloomIndicesBlake3<const M: usize> {
-    output_reader: blake3::OutputReader,
-}
-
-impl<const M: usize> From<&[u8]> for BloomIndicesBlake3<M> {
-    fn from(element: &[u8]) -> Self {
-        Self {
-            output_reader: blake3::Hasher::new().update(element).finalize_xof(),
-        }
-    }
-}
-
-impl<const M: usize> Iterator for BloomIndicesBlake3<M> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8; 8];
-        self.output_reader.fill(&mut buf);
-        let yld = usize::from_le_bytes(buf);
-        Some(yld % (M * 8))
-    }
 }
 
 impl<const M: usize, const K: usize> Bloom<M, K> {
@@ -135,13 +20,13 @@ impl<const M: usize, const K: usize> Bloom<M, K> {
     }
 
     pub fn add(&mut self, element: &[u8]) {
-        for index in BloomIndicesXXH3RejectionSampling::<M>::from(element).take(K) {
+        for index in bloom_indices_for_element(element, M * 8, K) {
             self.set_bit(index);
         }
     }
 
     pub fn has(&self, element: &[u8]) -> bool {
-        for index in BloomIndicesXXH3RejectionSampling::<M>::from(element).take(K) {
+        for index in bloom_indices_for_element(element, M * 8, K) {
             if !self.test_bit(index) {
                 return false;
             }
@@ -186,6 +71,28 @@ impl<const M: usize, const K: usize> Bloom<M, K> {
         let bit_index = index % 8;
         (self.bytes[byte_index] & (1u8 << bit_index)) != 0
     }
+}
+
+fn bloom_indices_for_element(
+    element: &[u8],
+    max: usize,
+    k: usize,
+) -> impl Iterator<Item = usize> + '_ {
+    let mut next_pow_of2 = if max.count_ones() == 1 {
+        max
+    } else {
+        max.next_power_of_two()
+    };
+    let mut pow = 1;
+    while next_pow_of2 != 0 {
+        next_pow_of2 >>= 1;
+        pow += 1;
+    }
+    RejectionSampling::accept_smaller(
+        YieldBits::yield_bits(XXH3XOF::from(element).map(|u| u as usize), pow),
+        max,
+    )
+    .take(k)
 }
 
 fn fill_deterministic<const M: usize, const K: usize>(
@@ -311,28 +218,6 @@ fn test_xof() {
     println!("{:02x?}", buffer);
 }
 
-// #[test]
-// fn test_sha3_hashing_speed() {
-//     let before = Instant::now();
-//     use sha3::Digest;
-
-//     let mut hasher = sha3::Sha3_256::default();
-//     hasher.update(b"Hello, World!");
-//     let mut hash: [u8; 32] = hasher.finalize_reset().into();
-
-//     for _ in 0..100_000_000 {
-//         hasher.update(hash);
-//         hash = hasher.finalize_reset().into();
-//     }
-
-//     let after = Instant::now();
-//     println!(
-//         "{} {}",
-//         after.duration_since(before).as_millis(),
-//         hex::encode(hash)
-//     );
-// }
-
 #[test]
 fn test_xxh3_hashing_speed() {
     let before = Instant::now();
@@ -427,16 +312,17 @@ fn test_sth() {
 
 #[test]
 fn test_indices() {
-    println!("indices for 'one':");
-    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"one" as &[u8]).take(4) {
-        println!("{index}");
-    }
-    println!("indices for 'two':");
-    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"two" as &[u8]).take(4) {
-        println!("{index}");
-    }
-    println!("indices for 'three':");
-    for index in BloomIndicesXXH3RejectionSampling::<125>::from(b"three" as &[u8]).take(4) {
+    test_indices_for("one", 1000, 4);
+    test_indices_for("two", 1000, 4);
+    test_indices_for("three", 1000, 4);
+    test_indices_for("ducks", 10, 3);
+    test_indices_for("chickens", 10, 3);
+    test_indices_for("goats", 10, 3);
+}
+
+fn test_indices_for(s: &str, m: usize, k: usize) {
+    println!("indices for '{s}':");
+    for index in bloom_indices_for_element(s.as_bytes(), m, k) {
         println!("{index}");
     }
 }
